@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn.functional as F
 from torch.nn import Parameter
-import json
 
 from nerfstudio.cameras.cameras import Cameras
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
@@ -20,12 +19,30 @@ from pytorch3d.transforms import (
     matrix_to_quaternion,
     quaternion_raw_multiply,
 )
-from pytorch3d.loss import chamfer_distance
 
 from gsplat.project_gaussians import project_gaussians
 from gsplat.rasterize import rasterize_gaussians
 from gsplat.sh import spherical_harmonics
 from PIL import Image
+import math
+from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager
+from nerfstudio.engine.callbacks import TrainingCallback, TrainingCallbackAttributes, TrainingCallbackLocation
+
+if TYPE_CHECKING:
+    from nerfstudio.pipelines.base_pipeline import Pipeline
+
+
+def random_quat_tensor(N: int, device="cpu"):
+    
+    u = torch.rand(N, device=device)
+    v = torch.rand(N, device=device)
+    w = torch.rand(N, device=device)
+    return torch.stack([
+        torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
+        torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
+        torch.sqrt(u) * torch.sin(2 * math.pi * w),
+        torch.sqrt(u) * torch.cos(2 * math.pi * w),
+    ], dim=-1)
 
 
 @dataclass
@@ -71,13 +88,6 @@ class SplatfactoArtModelConfig(SplatfactoModelConfig):
     use_second_order_smoothness: bool = True
     """Use second-order (acceleration) instead of first-order (velocity) smoothness"""
 
-    # RGB visualization configuration (save each frame once at training start)
-    visualize_rgb: bool = True
-    """Save rendered RGBs during early training (first time each frame is seen)."""
-
-    visualize_rgb_post_step: Optional[int] = 30000
-    """If set, save each frame once more after training reaches this global step."""
-
 
 class SplatfactoArtModel(SplatfactoModel):
     """Articulated Gaussian splatting model with joint transformations"""
@@ -87,10 +97,6 @@ class SplatfactoArtModel(SplatfactoModel):
     def __init__(self, *args, metadata: Optional[Dict] = None, seed_points=None, **kwargs):
         self.metadata = metadata
         super().__init__(*args, seed_points=seed_points, **kwargs)
-        # Track which frames have been visualized at least once
-        self._visualized_frames: set[int] = set()
-        self._post_visualized_frames: set[int] = set()
-        self._evaluated_frames: set[int] = set()
     
     def populate_modules(self):
         """Initialize model parameters from metadata"""
@@ -109,81 +115,36 @@ class SplatfactoArtModel(SplatfactoModel):
         # Initialize joint parameters
         self._init_joint_parameters(device)
     
-    # def _init_gaussians(self, device: str):
-    #     """Initialize Gaussian parameters from metadata"""
-    #     gaussians = self.metadata["gaussians"]
-    #     self.gauss_params = torch.nn.ParameterDict({
-    #         "means": Parameter(gaussians["means"].to(device), requires_grad=True),
-    #         "scales": Parameter(gaussians["scales"].to(device), requires_grad=True),
-    #         "quats": Parameter(gaussians["quats"].to(device), requires_grad=True),
-    #         "opacities": Parameter(gaussians["opacities"].to(device), requires_grad=True),
-    #         "features_dc": Parameter(gaussians["features_dc"].to(device), requires_grad=True),
-    #         "features_rest": Parameter(gaussians["features_rest"].to(device), requires_grad=True),
-    #     })
-    import torch
-    from torch.nn import Parameter
-    
-    
-
-    def random_quat_tensor(N: int, device="cpu"):
-        import math
-        """生成随机单位四元数"""
-        u = torch.rand(N, device=device)
-        v = torch.rand(N, device=device)
-        w = torch.rand(N, device=device)
-        return torch.stack([
-            torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
-            torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
-            torch.sqrt(u) * torch.sin(2 * math.pi * w),
-            torch.sqrt(u) * torch.cos(2 * math.pi * w),
-        ], dim=-1)
-
-
     def _init_gaussians(self, device: str):
         from sklearn.neighbors import NearestNeighbors
         """
-        初始化 Gaussian 参数：
-        - 从 seed_points（点云） 或 随机初始化
-        - 自动计算 scale (基于最近邻距离)
-        - 随机初始化四元数 (quaternion)
-        - 初始化颜色 (features_dc/rest)
-        - 初始化透明度 (opacities)
+        Initialize Gaussian parameters:
+        - Initialize from seed points or random values
+        - Recompute scale from nearest-neighbor distances
+        - Randomly initialize quaternions
+        - Initialize color features (features_dc/rest)
+        - Initialize opacities
         """
         gaussians = self.metadata["gaussians"]
-        cfg = self.config  # 假设你有 config 或对应参数
-        seed_points = getattr(self, "seed_points", None)
-        def random_quat_tensor(N: int, device="cpu"):
-            import math
-            """生成随机单位四元数"""
-            u = torch.rand(N, device=device)
-            v = torch.rand(N, device=device)
-            w = torch.rand(N, device=device)
-            return torch.stack([
-                torch.sqrt(1 - u) * torch.sin(2 * math.pi * v),
-                torch.sqrt(1 - u) * torch.cos(2 * math.pi * v),
-                torch.sqrt(u) * torch.sin(2 * math.pi * w),
-                torch.sqrt(u) * torch.cos(2 * math.pi * w),
-            ], dim=-1)
-
         num_points = gaussians["means"].shape[0]
 
-        # === 2️⃣ 计算 scale (基于邻域距离) ===
+        # Recompute scale from local-neighborhood distances.
         x_np = gaussians["means"].detach().cpu().numpy()
         nn_model = NearestNeighbors(n_neighbors=4, algorithm="auto").fit(x_np)
         distances, _ = nn_model.kneighbors(x_np)
-        # 去掉自身距离 (第一个是0)
+        # Drop self-distance (the first distance is 0).
         distances = torch.from_numpy(distances[:, 1:4]).to(device)
         # sklearn returns float64; clamp -> float32 keeps numerics stable for log
         avg_dist = distances.mean(dim=-1, keepdim=True).clamp_min(1e-8)
         avg_dist = avg_dist.to(dtype=gaussians["means"].dtype)
         scales = torch.log(avg_dist.repeat(1, 3)).to(dtype=torch.float32)
-        # === 3️⃣ 随机旋转 quaternion ===
+        # Randomly initialize quaternion rotations.
         quats = random_quat_tensor(num_points, device=device).to(dtype=torch.float32)
 
-        # === 5️⃣ 初始化透明度 ===
+        # Initialize opacities.
         # opacities = torch.logit(0.1 * torch.ones(num_points, 1, device=device)).to(dtype=torch.float32)
 
-        # === 6️⃣ 打包为 ParameterDict ===
+        # Pack parameters into a ParameterDict.
         self.gauss_params = torch.nn.ParameterDict({
             "means": Parameter(gaussians["means"].to(device), requires_grad=True),
             "scales": Parameter(scales, requires_grad=True),
@@ -279,6 +240,19 @@ class SplatfactoArtModel(SplatfactoModel):
             param_groups["rotation_offset"] = [self.rotation_offset_delta]
         
         return param_groups
+
+    def get_training_callbacks(
+        self, training_callback_attributes: TrainingCallbackAttributes
+    ) -> List[TrainingCallback]:
+        callbacks = super().get_training_callbacks(training_callback_attributes)
+        callbacks.append(
+            TrainingCallback(
+                [TrainingCallbackLocation.AFTER_TRAIN],
+                self.visualize_all_train_frames_after_train,
+                args=[training_callback_attributes.pipeline],
+            )
+        )
+        return callbacks
     
     @property
     def joint_axis(self) -> torch.Tensor:
@@ -375,7 +349,7 @@ class SplatfactoArtModel(SplatfactoModel):
         # Transform orientations: q' = q_R * q
         q_offset_wxyz = matrix_to_quaternion(R_offset[None])[0]  # [4] in wxyz
         quats_wxyz = torch.stack(
-            [self.quats[..., 3], self.quats[..., 0], self.quats[..., 1], self.quats[..., 2]],
+            [quats[..., 3], quats[..., 0], quats[..., 1], quats[..., 2]],
             dim=-1,
         )
         quats_transformed_wxyz = quaternion_raw_multiply(q_offset_wxyz[None, :], quats_wxyz)
@@ -402,11 +376,16 @@ class SplatfactoArtModel(SplatfactoModel):
             
             # Transform orientations: q' = q_R * q
             q_R_wxyz = matrix_to_quaternion(R_joint[None])[0]  # [4] in wxyz
-            quats_wxyz = torch.stack(
-                [self.quats[..., 3], self.quats[..., 0], self.quats[..., 1], self.quats[..., 2]],
+            quats_transformed_wxyz = torch.stack(
+                [
+                    quats_transformed[..., 3],
+                    quats_transformed[..., 0],
+                    quats_transformed[..., 1],
+                    quats_transformed[..., 2],
+                ],
                 dim=-1,
             )
-            quats_transformed_wxyz = quaternion_raw_multiply(q_R_wxyz[None, :], quats_wxyz)
+            quats_transformed_wxyz = quaternion_raw_multiply(q_R_wxyz[None, :], quats_transformed_wxyz)
             quats_transformed = torch.stack(
                 [
                     quats_transformed_wxyz[..., 1],
@@ -583,11 +562,7 @@ class SplatfactoArtModel(SplatfactoModel):
         
         # Optional depth rendering
         depth_im = None
-        current_step = getattr(self, "step", 0)
-        is_eval_step = (self.config.visualize_rgb_post_step is not None and 
-                        current_step >= self.config.visualize_rgb_post_step)
-        
-        if self.config.output_depth_during_training or not self.training or is_eval_step:
+        if self.config.output_depth_during_training or not self.training:
             depth_im = rasterize_gaussians(
                 xys, depths, radii, conics, num_tiles_hit,
                 depths[:, None].repeat(1, 3),
@@ -607,42 +582,7 @@ class SplatfactoArtModel(SplatfactoModel):
             "c2w": optimized_camera_to_world
         }
 
-        # Save training RGB the first time we see each frame
-        if self.training and self.config.visualize_rgb:
-            try:
-                self.visualize_training_rgb(outputs, camera)
-            except Exception:
-                pass
-
         return outputs
-
-    @torch.no_grad()
-    def visualize_training_rgb(self, outputs: Dict, camera: Cameras) -> None:
-        """Save rendered RGB once per frame at training start.
-
-        Args:
-            outputs: dict containing 'rgb' tensor [H, W, 3] in [0,1]
-            camera: Cameras used for rendering (expects metadata['frame_index'])
-        """
-        frame_idx = int(camera.metadata["frame_index"][0].item())
-
-        targets: List[Tuple[Path, str]] = []
-
-        if frame_idx not in self._visualized_frames:
-            self._visualized_frames.add(frame_idx)
-            vis_dir = Path(self.metadata["output_dir"]) / "rgb_vis_art"
-            targets.append((vis_dir, f"train_init_frame{frame_idx:05d}.png"))
-
-        if not targets:
-            return
-
-        rgb = outputs["rgb"].detach().cpu().numpy().clip(0, 1)
-        rgb_u8 = (rgb * 255).astype("uint8")
-
-        for directory, filename in targets:
-            directory.mkdir(parents=True, exist_ok=True)
-            img_path = directory / filename
-            Image.fromarray(rgb_u8).save(img_path)
     
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         """Compute losses with regularization"""
@@ -690,30 +630,13 @@ class SplatfactoArtModel(SplatfactoModel):
         
         with torch.no_grad():
             # Joint parameter statistics for monitoring optimization progress
-            # metrics_dict["joint_param_min"] = self.joint_params.min()
-            # metrics_dict["joint_param_max"] = self.joint_params.max()
-            # metrics_dict["joint_param_range"] = self.joint_params.max() - self.joint_params.min()
-            # metrics_dict["joint_param_mean"] = self.joint_params.abs().mean()
-            
-            # if self.joint_type == "revolute":
-            #     metrics_dict["joint_angle_deg_min"] = torch.rad2deg(self.joint_params.min())
-            #     metrics_dict["joint_angle_deg_max"] = torch.rad2deg(self.joint_params.max())
-            
-            # Compute changes relative to initialization
-            # Joint parameters change (per-frame)
+
             param_delta = self.joint_params - self.joint_params_init
-            # metrics_dict["joint_param_delta_rms"] = torch.sqrt((param_delta ** 2).mean())
-            # metrics_dict["joint_param_delta_max"] = param_delta.abs().max()
             metrics_dict["joint_param_delta_mean"] = param_delta.abs().mean()
             
             # Joint axis change (if optimized)
             if self.config.optimize_joint_axis:
-                # Magnitude of axis-angle adjustment
-                adjustment_angle = self.joint_axis_adjustment.norm()
-                # metrics_dict["joint_axis_adjustment_norm"] = adjustment_angle
-                # metrics_dict["joint_axis_adjustment_deg"] = torch.rad2deg(adjustment_angle)
-                
-                # Angular difference between current and initial axis (computed via dot product)
+
                 cos_angle = (self.joint_axis * self.joint_axis_base).sum()
                 # Clamp to avoid numerical issues with acos
                 cos_angle = torch.clamp(cos_angle, -1.0, 1.0)
@@ -723,185 +646,36 @@ class SplatfactoArtModel(SplatfactoModel):
             if self.config.optimize_joint_origin:
                 origin_delta = self.joint_origin - self.joint_origin_init
                 metrics_dict["joint_origin_delta_norm"] = origin_delta.norm()
-                # metrics_dict["joint_origin_delta_max"] = origin_delta.abs().max()
             
             # Rotation offset change (if optimized)
             if self.config.optimize_rotation_offset:
-                # Delta magnitude (axis-angle norm)
-                # Last 3 are rotation axis-angle
                 delta_angle = self.rotation_offset_delta[3:].norm()
                 metrics_dict["rotation_offset_delta_deg"] = torch.rad2deg(delta_angle)
-                
-                # Total rotation angle from base
-                # T = self.rotation_offset_se3
-                # R = T[:3, :3]
-                # R_base = self.rotation_offset_base[:3, :3]
-                # trace_val = torch.trace(R.T @ R_base)
-                # cos_theta = (trace_val - 1.0) / 2.0
-                # cos_theta = torch.clamp(cos_theta, -1.0, 1.0)  # Numerical stability
-                # total_angle = torch.acos(cos_theta)
-                # metrics_dict["rotation_offset_total_deg"] = torch.rad2deg(total_angle)
-
-            # End-of-training evaluation and saving
-            current_step = getattr(self, "step", 0)
-            post_step = self.config.visualize_rgb_post_step
-            frame_idx = outputs.get("frame_idx")
-            
-            if (post_step is not None and current_step >= post_step and 
-                frame_idx is not None and frame_idx not in self._evaluated_frames):
-                
-                self._evaluated_frames.add(frame_idx)
-                vis_dir = Path(self.metadata["output_dir"]) / "eval_results"
-                vis_dir.mkdir(parents=True, exist_ok=True)
-                
-                # 1. Save RGB
-                rgb = outputs["rgb"].detach().cpu().numpy().clip(0, 1)
-                rgb_u8 = (rgb * 255).astype("uint8")
-                Image.fromarray(rgb_u8).save(vis_dir / f"rgb_{frame_idx:05d}.png")
-                
-                # # 2. Save Depth
-                # if outputs["depth"] is not None:
-                #     depth = outputs["depth"].detach().cpu().numpy()
-                #     d_min, d_max = depth.min(), depth.max()
-                #     depth_vis = (depth - d_min) / (d_max - d_min + 1e-8)
-                #     depth_vis_u8 = (depth_vis.clip(0, 1) * 255).astype("uint8")[..., 0]
-                #     Image.fromarray(depth_vis_u8).save(vis_dir / f"depth_{frame_idx:05d}.png")
-
-                # # 3. Calculate metrics if GT exists
-                # frame_metrics = {"psnr": float(metrics_dict.get("psnr", 0))}
-                
-                # # Check for depth in batch (DepthDataset uses "depth_image")
-                # gt_depth_key = "depth_image" if "depth_image" in batch else ("depth" if "depth" in batch else None)
-                
-                # if gt_depth_key is not None and outputs["depth"] is not None:
-                #     # Point Cloud Chamfer Distance
-                #     camera = outputs["camera"]
-                #     gt_depth = batch[gt_depth_key].to(self.device).squeeze(-1)
-                #     pred_depth = outputs["depth"].squeeze(-1)
-                #     acc = outputs["accumulation"].squeeze(-1)
-                    
-                #     # Mask for background
-                #     mask_pred = acc > 0.5
-                #     mask_gt = gt_depth > 0
-                    
-                #     # Only calculate CD for pixels within the mask
-                #     if "mask" in batch:
-                #         gt_mask = batch["mask"].to(self.device).squeeze(-1) > 0.5
-                #         mask_gt = mask_gt & gt_mask
-                #         mask_pred = mask_pred & gt_mask
-                    
-                #     if mask_pred.sum() > 0 and mask_gt.sum() > 0:
-                #         # Use manual unprojection with intrinsics (Camera Space)
-                #         def unproject_depth(depth_map, mask_m, cam):
-                #             H_m, W_m = depth_map.shape
-                #             # Get intrinsics for this resolution
-                #             orig_H, orig_W = cam.height[0].item(), cam.width[0].item()
-                #             scale_w = W_m / orig_W
-                #             scale_h = H_m / orig_H
-                            
-                #             fx_m = cam.fx[0].item() * scale_w
-                #             fy_m = cam.fy[0].item() * scale_h
-                #             cx_m = cam.cx[0].item() * scale_w
-                #             cy_m = cam.cy[0].item() * scale_h
-                            
-                #             y_m, x_m = torch.meshgrid(
-                #                 torch.arange(H_m, device=self.device), 
-                #                 torch.arange(W_m, device=self.device), 
-                #                 indexing='ij'
-                #             )
-                #             u_m = x_m.float() + 0.5
-                #             v_m = y_m.float() + 0.5
-                            
-                #             z = depth_map[mask_m]
-                #             x = (u_m[mask_m] - cx_m) * z / fx_m
-                #             y = (v_m[mask_m] - cy_m) * z / fy_m
-                #             return torch.stack([x, y, z], dim=-1)
-
-                #         p_pred = unproject_depth(pred_depth, mask_pred, camera)
-                #         p_gt = unproject_depth(gt_depth, mask_gt, camera)
-
-                #         # Filter p_pred based on p_gt bounding box
-                #         if p_gt.shape[0] > 0 and p_pred.shape[0] > 0:
-                #             bbox_min = p_gt.min(dim=0)[0]
-                #             bbox_max = p_gt.max(dim=0)[0]
-                #             # Keep points in pred that are within gt's bounding box
-                #             in_bbox_mask = torch.all((p_pred >= bbox_min) & (p_pred <= bbox_max), dim=-1)
-                #             p_pred = p_pred[in_bbox_mask]
-
-                #         # Save combined point clouds as PLY with colors
-                #         def save_combined_ply(path, p_pred, p_gt):
-                #             p_pred = p_pred.detach().cpu().numpy()
-                #             p_gt = p_gt.detach().cpu().numpy()
-                #             n_pred = len(p_pred)
-                #             n_gt = len(p_gt)
-                            
-                #             with open(path, 'w') as f:
-                #                 header = (
-                #                     "ply\n"
-                #                     "format ascii 1.0\n"
-                #                     f"element vertex {n_pred + n_gt}\n"
-                #                     "property float x\n"
-                #                     "property float y\n"
-                #                     "property float z\n"
-                #                     "property uchar red\n"
-                #                     "property uchar green\n"
-                #                     "property uchar blue\n"
-                #                     "end_header\n"
-                #                 )
-                #                 f.write(header)
-                #                 # Pred: Red [255, 0, 0]
-                #                 for p in p_pred:
-                #                     f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} 255 0 0\n")
-                #                 # GT: Green [0, 255, 0]
-                #                 for p in p_gt:
-                #                     f.write(f"{p[0]:.6f} {p[1]:.6f} {p[2]:.6f} 0 255 0\n")
-
-                #         save_combined_ply(vis_dir / f"pc_combined_{frame_idx:05d}.ply", p_pred, p_gt)
-                        
-                #         # Downsample for metric efficiency
-                #         if p_pred.shape[0] > 50000:
-                #             p_pred_sub = p_pred[torch.randperm(p_pred.shape[0])[:50000]]
-                #         else:
-                #             p_pred_sub = p_pred
-                            
-                #         if p_gt.shape[0] > 50000:
-                #             p_gt_sub = p_gt[torch.randperm(p_gt.shape[0])[:50000]]
-                #         else:
-                #             p_gt_sub = p_gt
-                        
-                #         # Calculate squared CD and take sqrt for Euclidean distance
-                #         # Note: pytorch3d chamfer_distance returns squared distance
-                #         cd_val, _ = chamfer_distance(p_pred_sub[None], p_gt_sub[None])
-                #         cd_val = torch.sqrt(cd_val)
-                        
-                #         frame_metrics["chamfer_distance"] = float(cd_val)
-                #         metrics_dict["chamfer_distance"] = cd_val
-                
-                # # 4. Update summary JSON
-                # summary_path = vis_dir / "eval_summary.json"
-                # summary = {}
-                # if summary_path.exists():
-                #     try:
-                #         with open(summary_path, "r") as f:
-                #             summary = json.load(f)
-                #     except Exception:
-                #         pass
-                
-                # summary[str(frame_idx)] = frame_metrics
-                
-                # # Compute averages across all evaluated frames so far
-                # all_psnrs = [v["psnr"] for k, v in summary.items() if k != "average" and "psnr" in v]
-                # all_cds = [v["chamfer_distance"] for k, v in summary.items() if k != "average" and "chamfer_distance" in v]
-                
-                # summary["average"] = {
-                #     "psnr": sum(all_psnrs) / len(all_psnrs) if all_psnrs else 0,
-                #     "chamfer_distance": sum(all_cds) / len(all_cds) if all_cds else 0
-                # }
-                
-                # with open(summary_path, "w") as f:
-                #     json.dump(summary, f, indent=4)
         
         return metrics_dict
+
+    @torch.no_grad()
+    def visualize_all_train_frames_after_train(self, pipeline: Pipeline, step: int) -> None:
+        """Render every training frame once in eval mode after max iterations."""
+        assert pipeline is not None
+        datamanager = pipeline.datamanager
+        assert isinstance(datamanager, FullImageDatamanager)
+
+        pipeline.eval()
+        vis_dir = Path(self.metadata["output_dir"]) / "eval_results"
+        vis_dir.mkdir(parents=True, exist_ok=True)
+
+        cached_train = datamanager.cached_train
+        assert len(cached_train) == len(datamanager.train_dataset)
+        assert len(datamanager.train_dataset.cameras.shape) == 1, "Assumes single batch dimension"
+
+        for idx, _batch in enumerate(cached_train):
+            camera = datamanager.train_dataset.cameras[idx : idx + 1].to(self.device)
+            outputs = self.get_outputs_for_camera(camera=camera)
+            frame_idx = outputs["frame_idx"]
+            rgb = outputs["rgb"].detach().cpu().numpy().clip(0, 1)
+            rgb_u8 = (rgb * 255).astype("uint8")
+            Image.fromarray(rgb_u8).save(vis_dir / f"rgb_{frame_idx:05d}.png")
     
     def after_train(self, step: int):
         """Aggregate refinement stats from 2N concat to N base gaussians.
@@ -934,7 +708,7 @@ class SplatfactoArtModel(SplatfactoModel):
             grads_point = torch.maximum(grads_static, grads_mobile)
 
             # Track moving sums of grad norms and visibility counts (N)
-            if getattr(self, "xys_grad_norm", None) is None:
+            if self.xys_grad_norm is None:
                 self.xys_grad_norm = torch.zeros_like(grads_point)
                 self.vis_counts = torch.zeros_like(grads_point)
             assert self.vis_counts is not None
@@ -942,7 +716,7 @@ class SplatfactoArtModel(SplatfactoModel):
             self.xys_grad_norm[vis_any] = grads_point[vis_any] + self.xys_grad_norm[vis_any]
 
             # Update max screen size ratio per gaussian (N)
-            if getattr(self, "max_2Dsize", None) is None:
+            if self.max_2Dsize is None:
                 self.max_2Dsize = torch.zeros(n, device=grads_point.device, dtype=torch.float32)
             radii_static = self.radii.detach()[:n]
             radii_mobile = self.radii.detach()[n:]
@@ -955,8 +729,7 @@ class SplatfactoArtModel(SplatfactoModel):
         if not self.config.enable_gs_refinement:
             return
         # Ensure screen-size stats exist even if aggregation was skipped
-        if getattr(self, "max_2Dsize", None) is None:
+        if self.max_2Dsize is None:
             # match current number of points
             self.max_2Dsize = torch.zeros(self.num_points, device=self.device, dtype=torch.float32)
         super().refinement_after(optimizers, step)
-

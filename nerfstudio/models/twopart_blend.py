@@ -7,11 +7,9 @@ import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 
-import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from collections import OrderedDict
 from torch.nn import Parameter
 from typing_extensions import Literal
 from PIL import Image
@@ -21,16 +19,13 @@ from nerfstudio.cameras.lie_groups import exp_map_SO3xR3
 from nerfstudio.models.splatfacto import SplatfactoModel, SplatfactoModelConfig
 
 from pytorch3d.transforms import (
-    so3_log_map,
-    so3_exp_map,
-    axis_angle_to_quaternion,
     quaternion_raw_multiply,
     matrix_to_quaternion,
 )
 
 from gsplat.project_gaussians import project_gaussians
 from gsplat.rasterize import rasterize_gaussians
-from gsplat.sh import spherical_harmonics, num_sh_bases
+from gsplat.sh import spherical_harmonics
 
 @dataclass
 class TwoPartBlendModelConfig(SplatfactoModelConfig):
@@ -59,18 +54,7 @@ class TwoPartBlendModelConfig(SplatfactoModelConfig):
     
     obj_rot_l2_penalty: float = 0.0
     """L2 penalty for rotation adjustments"""
-    
-    # Temporal smoothness for object pose across frames
-    obj_pose_smoothness_enabled: bool = True
-    """Enable temporal smoothness regularization of object pose"""
-    
-    obj_smooth_trans_weight: float = 0.0
-    """Weight for translation smoothness between adjacent frames"""
-    
-    obj_smooth_rot_weight: float = 0.0
-    """Weight for rotation smoothness between adjacent frames"""
-    
-    
+
     export_ply_dir: Optional[str] = None
     """Directory for PLY exports"""
     
@@ -149,10 +133,10 @@ class TwoPartBlendModel(SplatfactoModel):
     def _load_fused_gaussians(self, device: str):
         """Load fused Gaussians from metadata"""
         md = self.metadata
-        # Prefer in-memory fused gaussians if provided, else load from path
-        if "fused_gaussians" in md and md.get("fused_gaussians") is not None:
-            fused = md["fused_gaussians"]
-            counts_info = md.get("fused_counts", {"n0": fused["means"].shape[0] // 2})
+        assert md is not None, "TwoPartBlend metadata is required"
+        assert md["fused_gaussians"] is not None, "metadata['fused_gaussians'] is required"
+        fused = md["fused_gaussians"]
+        counts_info = md["fused_counts"]
         
         # Load Gaussian parameters
         self.gauss_params["means"].data = fused["means"].to(device)
@@ -227,14 +211,13 @@ class TwoPartBlendModel(SplatfactoModel):
             print(f"[TwoPartBlend] Object pose optimization enabled: {n_frames} frames") 
 
     def _select_frame_index(self, camera: Cameras) -> int:
-        """Select frame index from camera metadata or by matching pose"""
-        if camera.metadata and "frame_index" in camera.metadata:
-            return int(camera.metadata["frame_index"])  # type: ignore
-        
-        # Match by comparing camera pose with part0 poses
-        c2w = camera.camera_to_worlds[0].to(self.device)
-        diffs = torch.linalg.norm(self._c2w0[:, :3, :4] - c2w[None, ...], dim=(1, 2))
-        return int(torch.argmin(diffs).item())
+        """Select frame index from camera metadata."""
+        assert camera.metadata is not None, "camera.metadata['frame_index'] is required"
+        frame_index = camera.metadata["frame_index"]
+        if isinstance(frame_index, torch.Tensor):
+            assert frame_index.numel() == 1, "Expected a single frame_index"
+            return int(frame_index.item())
+        return int(frame_index)
     
     def _get_object_transform(self, frame_idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Get full rigid object transformation for a frame
@@ -508,36 +491,6 @@ class TwoPartBlendModel(SplatfactoModel):
                 t_norm * self.config.obj_trans_l2_penalty + 
                 r_norm * self.config.obj_rot_l2_penalty
             )
-        
-        # Add temporal smoothness regularization across frames for the full object pose
-        if (
-            self.training
-            and getattr(self.config, "obj_pose_smoothness_enabled", False)
-            and hasattr(self, "obj_pose_adjustment")
-            and self.obj_pose_adjustment.shape[0] > 1
-        ):
-            # Build Adj matrices for all frames from se(3) adjustments
-            adj_3x4_all = exp_map_SO3xR3(self.obj_pose_adjustment)  # [F, 3, 4]
-            F_n = adj_3x4_all.shape[0]
-            bottom = torch.zeros((F_n, 1, 4), device=adj_3x4_all.device, dtype=adj_3x4_all.dtype)
-            bottom[:, :, 3] = 1.0
-            Adj_all = torch.cat([adj_3x4_all, bottom], dim=1)  # [F, 4, 4]
-            
-            # Full transforms T = T_obj_base @ Adj (gradient flows through Adj)
-            T_full = self._T_obj_base @ Adj_all  # [F, 4, 4]
-            R_all = T_full[:, :3, :3]
-            t_all = T_full[:, :3, 3]
-            
-            # Adjacent-frame differences
-            R_rel = R_all[:-1].transpose(1, 2) @ R_all[1:]
-            rot_log = so3_log_map(R_rel)  # [F-1, 3]
-            rot_smooth = rot_log.norm(dim=-1).mean()
-            trans_smooth = (t_all[1:] - t_all[:-1]).norm(dim=-1).mean()
-            
-            if self.config.obj_smooth_rot_weight > 0:
-                loss_dict["obj_opt_temporal_smooth_rot"] = rot_smooth * self.config.obj_smooth_rot_weight
-            if self.config.obj_smooth_trans_weight > 0:
-                loss_dict["obj_opt_temporal_smooth_trans"] = trans_smooth * self.config.obj_smooth_trans_weight
         
         return loss_dict
     

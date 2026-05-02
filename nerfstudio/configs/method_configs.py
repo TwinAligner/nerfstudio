@@ -30,11 +30,11 @@ from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager, Va
 from nerfstudio.data.datamanagers.full_images_datamanager import FullImageDatamanager, FullImageDatamanagerConfig
 from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManagerConfig
 from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManagerConfig
-# 导入 TwoPartBlend 的模型与数据解析器
+# Import TwoPartBlend model and dataparser.
 from nerfstudio.models.twopart_blend import TwoPartBlendModelConfig
 from nerfstudio.data.dataparsers.twopart_blend_dataparser import TwoPartBlendDataParserConfig
 
-# 导入 SplatfactoArt (Articulated GS) 的模型与数据解析器
+# Import SplatfactoArt (Articulated GS) model and dataparser.
 from nerfstudio.models.splatfacto_art import SplatfactoArtModelConfig
 from nerfstudio.data.dataparsers.splatfacto_art_dataparser import SplatfactoArtDataParserConfig
 
@@ -871,7 +871,7 @@ method_configs["twopart-blend"] = TrainerConfig(
 )
 SPLATFACTO_ART_GS_LR_SCALE = 0.5
 SPLATFACTO_ART_OPT_LR_SCALE = 1.0
-SPLATFACTO_ITERATIONS = 31000
+SPLATFACTO_ITERATIONS = 30000
 method_configs["splatfacto-art"] = TrainerConfig(
     method_name="splatfacto-art",
     steps_per_eval_image=100,

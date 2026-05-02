@@ -8,7 +8,7 @@ import torch
 from PIL import Image
 
 from nerfstudio.cameras import camera_utils
-from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
+from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import (
@@ -21,7 +21,6 @@ from nerfstudio.data.utils.dataparsers_utils import (
     read_camK,
     load_3dgs_ply,
     apply_left_se3_to_gaussians,
-    save_gaussians_to_ply,
 )
 from nerfstudio.utils.rich_utils import CONSOLE
 
@@ -153,9 +152,6 @@ class TwoPartBlendDataParser(DataParser):
         frames0_all = _load_all_frames_for_part(cfg.part0_dir)
         frames1_all = _load_all_frames_for_part(cfg.part1_dir)
         C0_aligned, C1_aligned, frames_ref, C0_common_orig, C1_common_orig = _align_two_pose_lists_by_first_frame(frames0_all, frames1_all)
-        # Save aligned transforms.json for both parts
-        # _save_aligned_transforms_json(cfg.part0_dir, frames_ref, C0_aligned)
-        # _save_aligned_transforms_json(cfg.part1_dir, frames_ref, C1_aligned)
 
         # Convert camera poses to OpenGL convention (cv -> gl)
         C0_gl = (C0_aligned @ CV_TO_GL)
@@ -356,13 +352,6 @@ class TwoPartBlendDataParser(DataParser):
             gp1_canon["scales"] = gp1_canon["scales"] + scale_log
             fused = {k: torch.cat([gp0_canon[k], gp1_canon[k]], dim=0).cpu() for k in ("means", "scales", "quats", "features_dc", "features_rest", "opacities")}
             fused_counts = {"n0": int(gp0["means"].shape[0]), "n1": int(gp1["means"].shape[0])}
-            # save to debug folder
-            debug_dir = self.config.output_dir / "debug"
-            debug_dir.mkdir(parents=True, exist_ok=True)
-            fused_ply_path = debug_dir / "twopart_fused_gaussians.ply"
-            if not fused_ply_path.exists():
-                save_gaussians_to_ply(fused, fused_ply_path)
-                CONSOLE.log(f"[green] Saved fused gaussians PLY to {fused_ply_path}")
             
             metadata_extra.update({
                 # In-memory fused gaussians for direct model consumption (avoid disk dependency)
@@ -398,20 +387,3 @@ class TwoPartBlendDataParser(DataParser):
             metadata=metadata_extra,
         )
         return dataparser_outputs
-
-
-
-
-
-
-def _save_aligned_transforms_json(part_dir: Path, frames_ref: List[dict], c2w_aligned: np.ndarray):
-    """Save transforms_aligned.json with given aligned c2w list (3x4 per frame)."""
-    out_frames = []
-    for i, fr in enumerate(frames_ref):
-        T = c2w_aligned[i]
-        out_frames.append({"file_path": fr["file_path"], "transform": T[:3, :].tolist()})
-    meta = {"frames": out_frames}
-    out_path = part_dir / "transforms_aligned.json"
-    with out_path.open("w") as f:
-        json.dump(meta, f, indent=4)
-    CONSOLE.log(f"[green] Saved aligned transforms to {out_path}")

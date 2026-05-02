@@ -2,19 +2,18 @@
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, Type
+from typing import Literal, Type
 import json
 import numpy as np
 import torch
 from PIL import Image
 
 from nerfstudio.cameras import camera_utils
-from nerfstudio.cameras.cameras import CAMERA_MODEL_TO_TYPE, Cameras, CameraType
+from nerfstudio.cameras.cameras import Cameras, CameraType
 from nerfstudio.data.dataparsers.base_dataparser import DataParser, DataParserConfig, DataparserOutputs
 from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.data.utils.dataparsers_utils import (
     get_train_eval_split_all,
-    get_train_eval_split_filename,
     get_train_eval_split_fraction,
     get_train_eval_split_interval,
     CV_TO_GL,
@@ -24,9 +23,6 @@ from nerfstudio.data.utils.dataparsers_utils import (
     apply_left_se3_to_gaussians,
 )
 from nerfstudio.utils.rich_utils import CONSOLE
-from pytorch3d.transforms import axis_angle_to_matrix, so3_log_map
-import os
-import matplotlib as mpl
 
 
 @dataclass
@@ -285,4 +281,3 @@ class SplatfactoArtDataParser(DataParser):
             dataparser_transform=transform_matrix,
             metadata=metadata,
         )
-
